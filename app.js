@@ -323,11 +323,18 @@ async function initPyodideEngine() {
       stderr: (msg) => logToConsole(`[Python stderr] ${msg}`)
     });
 
-    logToConsole("Loading essential Python wheels: pandas, openpyxl, micropip...");
-    statusEl.innerHTML = '<span class="status-dot"></span><span class="status-text">Loading pandas & openpyxl...</span>';
+    logToConsole("Loading essential Python wheels: pandas, micropip...");
+    statusEl.innerHTML = '<span class="status-dot"></span><span class="status-text">Loading pandas...</span>';
 
-    await state.pyodide.loadPackage(["pandas", "openpyxl", "micropip"]);
-    
+    await state.pyodide.loadPackage(["pandas", "micropip"]);
+
+    // openpyxl is pure-Python and isn't in Pyodide's built package repository,
+    // so it has to come from PyPI via micropip instead of loadPackage.
+    logToConsole("Installing openpyxl from PyPI via micropip...");
+    statusEl.innerHTML = '<span class="status-dot"></span><span class="status-text">Installing openpyxl...</span>';
+    const micropip = state.pyodide.pyimport("micropip");
+    await micropip.install("openpyxl");
+
     logToConsole("Compiling Python transformation engine...");
     await state.pyodide.runPythonAsync(PYTHON_RUNNER_SCRIPT);
 
@@ -348,14 +355,68 @@ async function initPyodideEngine() {
   }
 }
 
-// Log to Virtual Python Console
-function logToConsole(msg) {
+// Log to Virtual Python Console — the persistent in-app debugger.
+// Survives reloads via sessionStorage and flags unseen errors on the tab
+// itself, so a failure is never only visible in the browser devtools.
+const CONSOLE_LOG_KEY = "excel_automate_console_log";
+const CONSOLE_LOG_MAX_LINES = 500;
+
+function detectLogLevel(msg) {
+  if (/^\[ERROR\]/.test(msg)) return "error";
+  if (/^\[WARN\]/.test(msg)) return "warn";
+  if (msg.startsWith("✓")) return "success";
+  return "info";
+}
+
+function logToConsole(msg, level = null) {
   const consoleEl = document.getElementById("console-output");
   if (!consoleEl) return;
+  const resolvedLevel = level || detectLogLevel(msg);
   const timestamp = new Date().toLocaleTimeString();
-  consoleEl.textContent += `\n[${timestamp}] ${msg}`;
+  const line = document.createElement("span");
+  line.className = `console-line log-${resolvedLevel}`;
+  line.textContent = `[${timestamp}] ${msg}\n`;
+  consoleEl.appendChild(line);
+  consoleEl.scrollTop = consoleEl.scrollHeight;
+
+  while (consoleEl.childNodes.length > CONSOLE_LOG_MAX_LINES) {
+    consoleEl.removeChild(consoleEl.firstChild);
+  }
+
+  try {
+    sessionStorage.setItem(CONSOLE_LOG_KEY, consoleEl.innerHTML);
+  } catch (e) { /* sessionStorage unavailable or full — logging still works in-page */ }
+
+  if (resolvedLevel === "error") {
+    flagConsoleError();
+  }
+}
+
+function flagConsoleError() {
+  const badge = document.getElementById("console-error-badge");
+  const consolePanel = document.getElementById("console-tab");
+  if (badge && !consolePanel?.classList.contains("active")) {
+    badge.classList.remove("hidden");
+  }
+}
+
+function restoreConsoleLog() {
+  const consoleEl = document.getElementById("console-output");
+  if (!consoleEl) return;
+  const saved = sessionStorage.getItem(CONSOLE_LOG_KEY);
+  consoleEl.innerHTML = saved || "";
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
+
+// Surface any otherwise-uncaught JS error/rejection into the same debugger
+// panel, so future updates (from any tool) still get logged, not just
+// errors this file explicitly calls logToConsole() for.
+window.addEventListener("error", (event) => {
+  logToConsole(`[ERROR] Uncaught exception: ${event.message} (${event.filename}:${event.lineno})`, "error");
+});
+window.addEventListener("unhandledrejection", (event) => {
+  logToConsole(`[ERROR] Unhandled promise rejection: ${event.reason?.message || event.reason}`, "error");
+});
 
 // Toast Notifications
 function showToast(msg, type = "info") {
@@ -388,6 +449,11 @@ function initTabNavigation() {
       // Re-render chart if switching to visuals tab
       if (targetId === "charts-tab") {
         updateChartPreview();
+      }
+
+      // Acknowledge any pending error badge when the console is opened
+      if (targetId === "console-tab") {
+        document.getElementById("console-error-badge")?.classList.add("hidden");
       }
     });
   });
@@ -816,6 +882,7 @@ function initPWA() {
 
 // Initialize on DOM Loaded
 document.addEventListener("DOMContentLoaded", () => {
+  restoreConsoleLog();
   initTabNavigation();
   initFileHandlers();
   initThemeSelectors();
@@ -835,6 +902,14 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("run-pipeline-btn")?.addEventListener("click", executePythonPipeline);
   document.getElementById("clear-console-btn")?.addEventListener("click", () => {
     document.getElementById("console-output").textContent = "Console cleared.";
+    sessionStorage.removeItem(CONSOLE_LOG_KEY);
+    document.getElementById("console-error-badge")?.classList.add("hidden");
+  });
+  document.getElementById("copy-console-btn")?.addEventListener("click", () => {
+    const text = document.getElementById("console-output")?.innerText || "";
+    navigator.clipboard.writeText(text)
+      .then(() => showToast("Console logs copied to clipboard", "success"))
+      .catch(() => showToast("Could not copy logs", "error"));
   });
 
   // Password toggle
